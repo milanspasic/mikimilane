@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: setlens-free-recognition
+    runtime: docker
+    plan: free
+    envVars:
+      - key: SETLENS_ACCESS_TOKEN
+        generateValue: true
+      - key: SETLENS_HOST
+        value: 0.0.0.0

@@ -1,6 +1,7 @@
-"""Setlens keyless recognition backend. Uses ShazamIO's unofficial service connection."""
+"""Shared set recognition: official AudioTag free API or experimental ShazamIO."""
 from __future__ import annotations
 import argparse
+import audiotag
 import asyncio
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -133,7 +134,7 @@ def merge_match(tracks, track, start, end):
     identity = str(track.get("key") or f"{artist.lower()}::{title.lower()}")
     for previous in reversed(tracks):
         if previous["identity"] == identity and start <= previous["end"] + CHUNK_SECONDS:
-            previous["end"] = end
+            previous["end"] = max(previous["end"], end)
             return
     link = track.get("url")
     if not isinstance(link, str) or not link.startswith("https://"):
@@ -208,13 +209,36 @@ class QuietLogger:
         pass
 
 
-def run_scan(job_id, url, minutes, source_file=None):
+def recognize_audiotag(job_id, path, key):
+    import audiotag
+    tracks = []
+    cancelled = JOBS[job_id]["cancel"]
+    for start, seconds, audio in audiotag.audio_chunks(path):
+        data = audiotag.recognize_chunk(key, audio, seconds, cancelled)
+        for begin, end, track in audiotag.matches(data, start, seconds):
+            merge_match(tracks, track, begin, end)
+        visible = [{k: v for k, v in t.items() if k != "identity"} for t in tracks]
+        update(job_id, tracks=visible, processedSeconds=start + seconds)
+
+
+def run_scan(job_id, url, minutes, source_file=None, engine="shazam", api_key="", test=False):
     try:
         from yt_dlp import YoutubeDL
         import imageio_ffmpeg
         with tempfile.TemporaryDirectory(prefix="setlens-") as scratch:
             work = Path(scratch)
-            if source_file:
+            if test:
+                import urllib.request
+                source = work / "test.ogg"
+                # Fixed public maintainer sample. Callers cannot choose a download target.
+                sample_url = "https://raw.githubusercontent.com/shazamio/ShazamIO/master/examples/data/Gloria.ogg"
+                with urllib.request.urlopen(sample_url, timeout=30) as response:
+                    data = response.read(10 * 1024 * 1024 + 1)
+                if len(data) > 10 * 1024 * 1024:
+                    raise ValueError("The connection-test sample was too large.")
+                source.write_bytes(data)
+                title = "Connection test: Gloria Gaynor — I Will Survive"
+            elif source_file:
                 source = Path(source_file)
                 title = source.name
             else:
@@ -248,7 +272,7 @@ def run_scan(job_id, url, minutes, source_file=None):
                 raise InterruptedError("Scan stopped.")
             update(job_id, stage="preparing", title=title)
             wav_path = work / "recording.wav"
-            command = [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-v", "error", "-i", str(source), "-t", str(minutes * 60), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-y", str(wav_path)]
+            command = [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-v", "error", "-i", str(source), "-t", str(30 if test else minutes * 60), "-vn", "-ac", "1", "-ar", "8000" if engine == "audiotag" else "16000", "-c:a", "pcm_s16le", "-y", str(wav_path)]
             process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             deadline = time.monotonic() + 600
             while process.poll() is None:
@@ -262,7 +286,15 @@ def run_scan(job_id, url, minutes, source_file=None):
             if duration < 2:
                 raise ValueError("Provide at least 2 seconds of audio.")
             update(job_id, stage="recognizing", durationSeconds=duration, capReached=duration >= minutes * 60 - .1)
-            asyncio.run(recognize_file(job_id, wav_path))
+            if engine == "audiotag":
+                recognize_audiotag(job_id, wav_path, api_key)
+            else:
+                asyncio.run(recognize_file(job_id, wav_path))
+            if test:
+                verified = any("gloria gaynor" in t["artist"].lower() and "i will survive" in t["title"].lower() for t in JOBS[job_id]["tracks"])
+                if not verified:
+                    raise RuntimeError("The sample was processed, but the expected song was not identified. Recognition is not verified yet.")
+                update(job_id, verified=True)
             update(job_id, status="complete", stage="complete")
     except Exception as exc:
         update(job_id, status="stopped" if JOBS[job_id]["cancel"].is_set() else "failed", stage="finished", error=str(exc)[:500], errorCode=getattr(exc, "code", None), retryAfterSeconds=getattr(exc, "retry_after", 0))
@@ -270,12 +302,18 @@ def run_scan(job_id, url, minutes, source_file=None):
         ACTIVE.release()
 
 
-def create_job(url, minutes, source_file=None):
+def create_job(url, minutes, source_file=None, engine="shazam", api_key="", test=False):
     if isinstance(minutes, bool) or minutes not in (30, 60, 120, 240):
         raise ValueError("Choose a scan limit of 30, 60, 120 or 240 minutes.")
-    if not source_file:
+    if not source_file and not test:
         url = validate_url(url)
-    remaining = recognition_cooldown()
+    if engine not in ("audiotag", "shazam"):
+        raise ValueError("Choose AudioTag or ShazamIO.")
+    if engine == "audiotag" and (not isinstance(api_key, str) or not api_key.strip() or len(api_key) > 512 or any(c in api_key for c in "\r\n")):
+        raise ValueError("The owner needs to connect AudioTag in Settings.")
+    if test and engine != "audiotag":
+        raise ValueError("Connection tests use AudioTag.")
+    remaining = recognition_cooldown() if engine == "shazam" else 0
     if remaining:
         raise RecognitionFailure("Shazam is temporarily limiting recognition. Please wait before starting another scan.", "SHAZAM_RATE_LIMITED", 429, remaining)
     if not ACTIVE.acquire(blocking=False):
@@ -290,7 +328,7 @@ def create_job(url, minutes, source_file=None):
             if completed:
                 del JOBS[completed[0]]
         JOBS[job_id] = {"id": job_id, "status": "processing", "stage": "queued", "title": "DJ set", "tracks": [], "processedSeconds": 0, "durationSeconds": None, "capReached": False, "error": None, "updatedAt": time.time(), "cancel": threading.Event()}
-    threading.Thread(target=run_scan, args=(job_id, url, minutes, source_file), daemon=True).start()
+    threading.Thread(target=run_scan, args=(job_id, url, minutes, source_file, engine, api_key, test), daemon=True).start()
     return public_job(job_id)
 
 
@@ -326,7 +364,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.send_json(401, {"error": "This backend requires its private access token."})
         if self.path == "/health":
-            return self.send_json(200, {"service": "setlens-free", "version": 2, "recognition": "ShazamIO (unofficial)", "nodeAvailable": bool(shutil.which("node") or shutil.which("deno")), "recognitionIntervalSeconds": REQUEST_PAUSE, "retryAfterSeconds": recognition_cooldown()})
+            return self.send_json(200, {"service": "setlens-free", "version": 3, "engines": ["audiotag", "shazam"], "recognition": "AudioTag API / ShazamIO (unofficial)", "nodeAvailable": bool(shutil.which("node") or shutil.which("deno")), "recognitionIntervalSeconds": REQUEST_PAUSE, "retryAfterSeconds": recognition_cooldown()})
         if self.path.startswith("/v1/scans/"):
             job = public_job(self.path.split("/")[-1])
             return self.send_json(200 if job else 404, job or {"error": "Scan not found. Results expire two hours after completion or when the server restarts."})
@@ -346,8 +384,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
                 raise ValueError("Send a JSON object.")
-            if self.path == "/v1/scans":
-                job = create_job(body.get("url"), body.get("scanMinutes", 120))
+            if self.path == "/v1/connection-check":
+                import audiotag
+                key = body.get("apiKey")
+                if not isinstance(key, str) or not key.strip() or len(key) > 512:
+                    raise ValueError("Enter an active AudioTag API key.")
+                return self.send_json(200, {"valid": True, "freeSeconds": audiotag.free_seconds(key)})
+            if self.path in ("/v1/scans", "/v1/test"):
+                job = create_job(body.get("url"), body.get("scanMinutes", 120), engine=body.get("engine", "shazam"), api_key=body.get("apiKey", ""), test=self.path == "/v1/test")
                 return self.send_json(202, job)
             if self.path.endswith("/cancel"):
                 job_id = self.path.split("/")[-2]
@@ -358,6 +402,8 @@ class Handler(BaseHTTPRequestHandler):
                     job["cancel"].set()
                 return self.send_json(200, {"stopping": True})
             return self.send_json(404, {"error": "Not found"})
+        except audiotag.AudioTagFailure as exc:
+            self.send_json(422, {"error": str(exc), "code": exc.code})
         except RecognitionFailure as exc:
             self.send_json(429 if exc.code == "SHAZAM_RATE_LIMITED" else 500, {"error": str(exc), "code": exc.code, "retryAfterSeconds": exc.retry_after})
         except BlockingIOError as exc:
@@ -391,7 +437,7 @@ def main():
         print("Saved:", output)
         return
     print(f"Setlens Free is ready at http://{host}:{port}", flush=True)
-    print("Unofficial recognition connection; no paid recognition key. Keep this terminal open.", flush=True)
+    print("Shared recognition server ready. AudioTag uses an owner API key; ShazamIO is experimental.", flush=True)
     try:
         ThreadingHTTPServer((host, port), Handler).serve_forever()
     except KeyboardInterrupt:

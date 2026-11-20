@@ -6,6 +6,6 @@ ENV PATH="/opt/deno/bin:${PATH}" SETLENS_HOST=0.0.0.0 PORT=8765 PYTHONUNBUFFERED
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY server.py index.html ./
+COPY server.py audiotag.py index.html ./
 EXPOSE 8765
 CMD ["python", "server.py"]

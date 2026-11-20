@@ -2,6 +2,8 @@
 from __future__ import annotations
 import argparse
 import asyncio
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import hmac
 import io
 import json
@@ -24,7 +26,70 @@ LOCK = threading.RLock()
 ACTIVE = threading.BoundedSemaphore(1)
 ACCESS_TOKEN = os.environ.get("SETLENS_ACCESS_TOKEN", "")
 CHUNK_SECONDS = 12
-REQUEST_PAUSE = 3
+REQUEST_PAUSE = 15
+NEXT_REQUEST_AT = 0.0
+COOLDOWN_UNTIL = 0.0
+
+
+class RecognitionFailure(RuntimeError):
+    def __init__(self, message, code, http_status=None, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(value, now=None):
+    now = time.time() if now is None else now
+    try:
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = date.timestamp() - now
+        except (ValueError, TypeError, OverflowError, AttributeError):
+            seconds = 300
+    return max(REQUEST_PAUSE, math.ceil(seconds))
+
+
+def recognition_cooldown():
+    with LOCK:
+        return max(0, math.ceil(COOLDOWN_UNTIL - time.time()))
+
+
+async def wait_for_recognition_slot(cancelled):
+    global NEXT_REQUEST_AT
+    while True:
+        if cancelled.is_set():
+            raise InterruptedError("Scan stopped. Partial results are available.")
+        with LOCK:
+            remaining = NEXT_REQUEST_AT - time.monotonic()
+            if remaining <= 0:
+                NEXT_REQUEST_AT = time.monotonic() + REQUEST_PAUSE
+                return
+        await asyncio.sleep(min(.2, remaining))
+
+
+def recognition_failure(error, metadata):
+    from shazamio.exceptions import RateLimited
+    from shazamio_core import SignatureError
+    status = metadata.get("status")
+    if isinstance(error, RateLimited) or status == 429:
+        wait = retry_after_seconds(metadata.get("retry_after"))
+        return RecognitionFailure(f"Shazam is limiting recognition requests (HTTP 429). This scan stopped and partial results are kept. Wait at least {max(1, math.ceil(wait / 60))} minutes before starting another scan.", "SHAZAM_RATE_LIMITED", 429, wait)
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return RecognitionFailure("Shazam did not respond within 45 seconds. This scan stopped; partial results are kept.", "SHAZAM_TIMEOUT")
+    if isinstance(error, SignatureError):
+        return RecognitionFailure("An audio fragment could not be fingerprinted. This scan stopped; partial results are kept.", "AUDIO_FINGERPRINT_FAILED")
+    if status in (401, 403):
+        return RecognitionFailure(f"Shazam refused the recognition request (HTTP {status}). This scan stopped; partial results are kept.", "SHAZAM_ACCESS_REFUSED", status)
+    if status:
+        return RecognitionFailure(f"Shazam returned an invalid recognition response (HTTP {status}). This scan stopped; partial results are kept.", "SHAZAM_RESPONSE_FAILED", status)
+    return RecognitionFailure("The connection to Shazam failed. This scan stopped; partial results are kept.", "SHAZAM_CONNECTION_FAILED")
 
 
 def validate_url(value):
@@ -98,31 +163,40 @@ def audio_chunks(path):
 
 
 async def recognize_file(job_id, path):
+    global COOLDOWN_UNTIL
     from aiohttp_retry import ExponentialRetry
     from shazamio import Shazam
     from shazamio.client import HTTPClient
     tracks = []
     cancelled = JOBS[job_id]["cancel"]
+    metadata = {}
+    async def capture_response(_session, _context, params):
+        metadata.update(status=params.response.status, retry_after=params.response.headers.get("Retry-After"))
     # A single client and no automatic retries. Stop on service errors/rate limiting.
     async with HTTPClient(retry_options=ExponentialRetry(attempts=1)) as client:
+        client.trace_config.on_request_end.append(capture_response)
         async with Shazam(http_client=client) as recognizer:
             for start, seconds, data, audible in audio_chunks(path):
                 if cancelled.is_set():
                     raise InterruptedError("Scan stopped. Partial results are available.")
                 if audible:
+                    await wait_for_recognition_slot(cancelled)
+                    metadata.clear()
                     try:
                         result = await asyncio.wait_for(recognizer.recognize(data, proxy=os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")), timeout=45)
+                        if metadata.get("status", 200) >= 400:
+                            raise RuntimeError("Recognition service returned an HTTP error.")
                     except Exception as exc:
-                        raise RuntimeError("Shazam's unofficial connection could not continue. It may be rate-limited or unavailable. No automatic retry was made; partial results are kept.") from exc
+                        failure = recognition_failure(exc, metadata)
+                        if failure.retry_after:
+                            with LOCK:
+                                COOLDOWN_UNTIL = max(COOLDOWN_UNTIL, time.time() + failure.retry_after)
+                        print(json.dumps({"event": "recognition_failed", "code": failure.code, "httpStatus": failure.http_status, "errorType": type(exc).__name__, "atSeconds": start}), flush=True)
+                        raise failure from exc
                     merge_match(tracks, result.get("track"), start, start + seconds)
                 # Clip offsets are set-relative; Shazam's own match offset is song-relative.
                 visible = [{k: v for k, v in t.items() if k != "identity"} for t in tracks]
                 update(job_id, tracks=visible, processedSeconds=start + seconds)
-                if audible:
-                    for _ in range(REQUEST_PAUSE * 5):
-                        if cancelled.is_set():
-                            raise InterruptedError("Scan stopped. Partial results are available.")
-                        await asyncio.sleep(.2)
 
 
 class QuietLogger:
@@ -191,7 +265,7 @@ def run_scan(job_id, url, minutes, source_file=None):
             asyncio.run(recognize_file(job_id, wav_path))
             update(job_id, status="complete", stage="complete")
     except Exception as exc:
-        update(job_id, status="stopped" if JOBS[job_id]["cancel"].is_set() else "failed", stage="finished", error=str(exc)[:500])
+        update(job_id, status="stopped" if JOBS[job_id]["cancel"].is_set() else "failed", stage="finished", error=str(exc)[:500], errorCode=getattr(exc, "code", None), retryAfterSeconds=getattr(exc, "retry_after", 0))
     finally:
         ACTIVE.release()
 
@@ -201,6 +275,9 @@ def create_job(url, minutes, source_file=None):
         raise ValueError("Choose a scan limit of 30, 60, 120 or 240 minutes.")
     if not source_file:
         url = validate_url(url)
+    remaining = recognition_cooldown()
+    if remaining:
+        raise RecognitionFailure("Shazam is temporarily limiting recognition. Please wait before starting another scan.", "SHAZAM_RATE_LIMITED", 429, remaining)
     if not ACTIVE.acquire(blocking=False):
         raise BlockingIOError("The recognition server is busy. Try again after the current set finishes.")
     job_id = secrets.token_urlsafe(24)
@@ -228,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        if status == 429 and body.get("retryAfterSeconds", 0) > 0:
+            self.send_header("Retry-After", str(math.ceil(body["retryAfterSeconds"])))
         self.end_headers()
         self.wfile.write(payload)
     def authorized(self):
@@ -247,7 +326,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.send_json(401, {"error": "This backend requires its private access token."})
         if self.path == "/health":
-            return self.send_json(200, {"service": "setlens-free", "version": 1, "recognition": "ShazamIO (unofficial)", "nodeAvailable": bool(shutil.which("node") or shutil.which("deno"))})
+            return self.send_json(200, {"service": "setlens-free", "version": 2, "recognition": "ShazamIO (unofficial)", "nodeAvailable": bool(shutil.which("node") or shutil.which("deno")), "recognitionIntervalSeconds": REQUEST_PAUSE, "retryAfterSeconds": recognition_cooldown()})
         if self.path.startswith("/v1/scans/"):
             job = public_job(self.path.split("/")[-1])
             return self.send_json(200 if job else 404, job or {"error": "Scan not found. Results expire two hours after completion or when the server restarts."})
@@ -279,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
                     job["cancel"].set()
                 return self.send_json(200, {"stopping": True})
             return self.send_json(404, {"error": "Not found"})
+        except RecognitionFailure as exc:
+            self.send_json(429 if exc.code == "SHAZAM_RATE_LIMITED" else 500, {"error": str(exc), "code": exc.code, "retryAfterSeconds": exc.retry_after})
         except BlockingIOError as exc:
             self.send_json(429, {"error": str(exc)})
         except (ValueError, TypeError, json.JSONDecodeError) as exc:

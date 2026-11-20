@@ -69,7 +69,7 @@ Send `Authorization: Bearer <SETLENS_ACCESS_TOKEN>` on all online requests. This
 - `POST /v1/scans/{id}/cancel` stops a job while keeping partial results.
 - Every POST also needs `Content-Type: application/json` and `X-Setlens-Client: 1`.
 
-One set runs at a time. Recognition uses consecutive 12-second audio windows, with a three-second pause between network recognition requests and no automatic retries. Approximate timestamps use the beginning of the recognised sample in the set, not Shazam's position inside the original song. Nearby repeated matches merge; later reappearances remain separate. No matches are invented. A duration cap can truncate longer sets and is disclosed.
+One set runs at a time. Recognition uses consecutive 12-second audio windows, with at least 15 seconds between recognition requests across all jobs and no automatic retries. A returned HTTP 429 stops the job and preserves its matches. The backend refuses new scans until Retry-After has elapsed, or for five minutes when the provider does not supply a wait time. This reduces request pressure but does not guarantee uninterrupted access. Long sets can take longer than their playing time. Approximate timestamps use the beginning of the recognised sample in the set, not Shazam's position inside the original song. Nearby repeated matches merge; later reappearances remain separate. No matches are invented. A duration cap can truncate longer sets and is disclosed.
 
 Temporary downloaded/converted audio is deleted when a scan finishes. Platform restrictions are respected: no login cookies or attempts to bypass private, paid or restricted recordings are included. If a public link cannot download, try another one or your own local audio file. ShazamIO and yt-dlp are third-party dependencies and may need maintenance as upstream services change.
 
@@ -80,3 +80,5 @@ Run `python -m unittest -v test_server.py`. Tests cover URL validation, real sam
 During authoring, the live pipeline correctly identified the maintainer's public Gloria.ogg sample as Gloria Gaynor — I Will Survive, starting at 00:00, and merged repeated detections. A later upstream request failed and the backend correctly kept partial results. A complete long DJ-set scan has not been verified. Treat this free engine as experimental; availability and recognition accuracy are not guaranteed.
 
 Source for the recognition client: https://github.com/shazamio/ShazamIO
+
+Recognition failures are classified separately as rate limits, timeouts, rejected access, invalid responses or fingerprinting failures. Logs include only an error category, HTTP status and sample offset, never tokens, audio or full provider URLs. `/health` version 2 reports the minimum recognition interval and any known cooldown. Cooldown and pacing state are in memory, like the jobs.

@@ -385,7 +385,6 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Send a JSON object.")
             if self.path == "/v1/connection-check":
-                import audiotag
                 key = body.get("apiKey")
                 if not isinstance(key, str) or not key.strip() or len(key) > 512:
                     raise ValueError("Enter an active AudioTag API key.")

@@ -70,6 +70,16 @@ class BackendTests(unittest.TestCase):
                 auth={'Authorization':'Bearer '+'x'*40}
                 with urllib.request.urlopen(urllib.request.Request(root+'/health',headers=auth)) as r:
                     self.assertEqual(json.load(r)['service'],'setlens-free')
+                post_headers={**auth,'Content-Type':'application/json','X-Setlens-Client':'1'}
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(urllib.request.Request(root+'/v1/scans',headers=post_headers,data=json.dumps({'url':None,'scanMinutes':30}).encode()))
+                self.assertEqual(error.exception.code,400)
+                self.assertEqual(json.load(error.exception)['error'],'Paste a YouTube or SoundCloud set link.')
+                with patch.object(server.audiotag,'free_seconds',side_effect=server.audiotag.AudioTagFailure('Invalid key','AUDIOTAG_KEY_INVALID')):
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(urllib.request.Request(root+'/v1/connection-check',headers=post_headers,data=b'{"apiKey":"test-invalid"}'))
+                    self.assertEqual(error.exception.code,422)
+                    self.assertEqual(json.load(error.exception)['code'],'AUDIOTAG_KEY_INVALID')
                 headers={**auth,'Content-Type':'application/json','X-Setlens-Client':'1','Origin':'https://another-site.test'}
                 with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(urllib.request.Request(root+'/v1/scans',headers=headers,data=b'{}'))
                 self.assertEqual(error.exception.code,403)
